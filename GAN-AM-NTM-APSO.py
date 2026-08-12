@@ -1,610 +1,398 @@
-"""
-GAN-AM-NTM-APSO.py
-
-Main experimental pipeline:
-DataSet.xlsx
-    ↓
-Preprocessing
-    ↓
-GAN augmentation
-    ↓
-AM-NTM temporal learning
-    ↓
-APSO optimization
-    ↓
-PM2.5 / PM10 / AQI prediction
-    ↓
-MAE / RMSE / MAPE / R2
-"""
-
 import os
 import random
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score
 )
 
-# Local research modules
-from GAN import generate_synthetic_data
-from NTM import build_am_ntm_model
-from APSO import optimize_model
-
-
-# ============================================================
-# 1. Reproducibility
-# ============================================================
+from GAN import EnvironmentalGAN
+from NTM import build_am_ntm
+from APSO import optimize_hyperparameters
 
 SEED = 42
-
-os.environ["PYTHONHASHSEED"] = str(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-
-# ============================================================
-# 2. Configuration
-# ============================================================
-
 DATA_FILE = "DataSet.xlsx"
+TARGETS = ["PM2.5", "PM10", "AQI"]
 
-TARGETS = [
-    "PM2.5",
-    "PM10",
-    "AQI"
-]
-
-SEQUENCE_LENGTH = 24
-
+SEQ_LEN = 24
 TRAIN_RATIO = 0.70
-VALIDATION_RATIO = 0.15
-TEST_RATIO = 0.15
+VAL_RATIO = 0.15
 
+GAN_EPOCHS = 300
+FINAL_EPOCHS = 50
 BATCH_SIZE = 64
-EPOCHS = 50
 
-
-# ============================================================
-# 3. Load dataset
-# ============================================================
 
 def load_dataset():
-
-    if not os.path.exists(DATA_FILE):
-        raise FileNotFoundError(
-            f"Dataset not found: {DATA_FILE}"
-        )
-
-    df = pd.read_excel(DATA_FILE)
-
-    df = df.replace(
-        [np.inf, -np.inf],
-        np.nan
+    df = (
+        pd.read_excel(DATA_FILE)
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+        .reset_index(drop=True)
     )
 
-    df = df.dropna()
-
-    print("\nDataset shape:")
-    print(df.shape)
-
-    print("\nDataset columns:")
-    print(df.columns.tolist())
-
-    return df
-
-
-# ============================================================
-# 4. Prepare features and targets
-# ============================================================
-
-def prepare_data(df):
-
-    missing_targets = [
-        target for target in TARGETS
-        if target not in df.columns
+    missing = [
+        c for c in TARGETS
+        if c not in df.columns
     ]
 
-    if missing_targets:
-
+    if missing:
         raise ValueError(
-            "The following target columns were not found: "
-            + str(missing_targets)
+            f"Missing target columns: {missing}"
         )
 
-    numeric_columns = df.select_dtypes(
+    numeric = df.select_dtypes(
         include=[np.number]
     ).columns.tolist()
 
-    feature_columns = [
-        c for c in numeric_columns
+    features = [
+        c for c in numeric
         if c not in TARGETS
     ]
 
-    # If the dataset contains no separate predictors,
-    # use the target variables as input features.
-    if len(feature_columns) == 0:
-        feature_columns = TARGETS.copy()
+    if not features:
+        raise ValueError(
+            "No predictor columns were found."
+        )
 
-    X = df[feature_columns].values.astype(
+    return df, features
+
+
+def make_sequences(X, y):
+    Xs, ys = [], []
+
+    for i in range(
+        len(X) - SEQ_LEN
+    ):
+        Xs.append(
+            X[i:i + SEQ_LEN]
+        )
+        ys.append(
+            y[i + SEQ_LEN]
+        )
+
+    return (
+        np.asarray(Xs, dtype=np.float32),
+        np.asarray(ys, dtype=np.float32)
+    )
+
+
+def evaluate_metrics(y_true, y_pred):
+    return {
+        "MAE": mean_absolute_error(
+            y_true, y_pred
+        ),
+        "RMSE": np.sqrt(
+            mean_squared_error(
+                y_true, y_pred
+            )
+        ),
+        "MAPE (%)": np.mean(
+            np.abs(
+                (y_true - y_pred)
+                / np.maximum(
+                    np.abs(y_true),
+                    1e-8
+                )
+            )
+        ) * 100,
+        "R2": r2_score(
+            y_true, y_pred
+        )
+    }
+
+
+def main():
+
+    df, features = load_dataset()
+
+    columns = features + TARGETS
+
+    raw = df[columns].values.astype(
         np.float32
     )
 
-    y = df[TARGETS].values.astype(
-        np.float32
-    )
-
-    print("\nInput features:")
-    print(feature_columns)
-
-    print("\nPrediction targets:")
-    print(TARGETS)
-
-    return X, y, feature_columns
-
-
-# ============================================================
-# 5. Time-ordered train/validation/test split
-# ============================================================
-
-def split_data(X, y):
-
-    n = len(X)
+    n = len(raw)
 
     train_end = int(
         TRAIN_RATIO * n
     )
 
-    validation_end = int(
-        (TRAIN_RATIO + VALIDATION_RATIO) * n
+    val_end = int(
+        (TRAIN_RATIO + VAL_RATIO) * n
     )
 
-    X_train = X[:train_end]
-    X_validation = X[
-        train_end:validation_end
-    ]
-    X_test = X[validation_end:]
+    train_raw = raw[:train_end]
+    val_raw = raw[train_end:val_end]
+    test_raw = raw[val_end:]
 
-    y_train = y[:train_end]
-    y_validation = y[
-        train_end:validation_end
-    ]
-    y_test = y[validation_end:]
-
-    print("\nData split:")
-    print("Training:", X_train.shape)
-    print("Validation:", X_validation.shape)
-    print("Testing:", X_test.shape)
-
-    return (
-        X_train,
-        X_validation,
-        X_test,
-        y_train,
-        y_validation,
-        y_test
+    scaler = MinMaxScaler(
+        feature_range=(-1, 1)
     )
 
+    train = scaler.fit_transform(
+        train_raw
+    ).astype(np.float32)
 
-# ============================================================
-# 6. Scaling
-# ============================================================
+    val = scaler.transform(
+        val_raw
+    ).astype(np.float32)
 
-def scale_data(
-    X_train,
-    X_validation,
-    X_test,
-    y_train,
-    y_validation,
-    y_test
-):
+    test = scaler.transform(
+        test_raw
+    ).astype(np.float32)
 
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
+    # -------------------------------------------------------
+    # GAN augmentation is applied ONLY to the training data.
+    # -------------------------------------------------------
 
-    X_train = x_scaler.fit_transform(
-        X_train
+    gan = EnvironmentalGAN(
+        n_features=train.shape[1]
     )
 
-    X_validation = x_scaler.transform(
-        X_validation
+    gan_batch = min(
+        BATCH_SIZE,
+        len(train)
     )
 
-    X_test = x_scaler.transform(
-        X_test
+    gan.train(
+        train,
+        epochs=GAN_EPOCHS,
+        batch_size=gan_batch
     )
 
-    y_train = y_scaler.fit_transform(
-        y_train
+    synthetic_count = max(
+        1,
+        int(0.30 * len(train))
     )
 
-    y_validation = y_scaler.transform(
-        y_validation
+    synthetic = gan.generate(
+        synthetic_count
     )
 
-    y_test = y_scaler.transform(
-        y_test
+    augmented_train = np.vstack(
+        [train, synthetic]
     )
 
-    return (
-        X_train,
-        X_validation,
-        X_test,
-        y_train,
-        y_validation,
-        y_test,
-        x_scaler,
-        y_scaler
+    n_features = len(features)
+    n_targets = len(TARGETS)
+
+    X_train, y_train = make_sequences(
+        augmented_train[:, :],
+        augmented_train[:, n_features:]
     )
 
+    X_val, y_val = make_sequences(
+        val[:, :],
+        val[:, n_features:]
+    )
 
-# ============================================================
-# 7. Create temporal sequences
-# ============================================================
+    X_test, y_test = make_sequences(
+        test[:, :],
+        test[:, n_features:]
+    )
 
-def create_sequences(X, y):
+    # AM-NTM receives predictor variables only.
+    X_train = X_train[:, :, :n_features]
+    X_val = X_val[:, :, :n_features]
+    X_test = X_test[:, :, :n_features]
 
-    X_sequences = []
-    y_sequences = []
+    # -------------------------------------------------------
+    # APSO objective
+    # -------------------------------------------------------
 
-    for i in range(
-        len(X) - SEQUENCE_LENGTH
-    ):
+    def objective(position):
 
-        X_sequences.append(
-            X[
-                i:i + SEQUENCE_LENGTH
-            ]
+        controller_size = int(
+            round(position[0])
         )
 
-        y_sequences.append(
-            y[
-                i + SEQUENCE_LENGTH
-            ]
+        memory_size = int(
+            round(position[1])
         )
 
-    return (
-        np.asarray(
-            X_sequences,
-            dtype=np.float32
-        ),
-        np.asarray(
-            y_sequences,
-            dtype=np.float32
+        learning_rate = float(
+            position[2]
         )
-    )
 
+        model = build_am_ntm(
+            input_dim=n_features,
+            output_dim=n_targets,
+            controller_size=controller_size,
+            memory_size=memory_size,
+            learning_rate=learning_rate
+        )
 
-# ============================================================
-# 8. GAN augmentation
-# ============================================================
-
-def perform_gan_augmentation(
-    X_train,
-    augmentation_ratio=0.30
-):
-
-    number_of_samples = int(
-        len(X_train) *
-        augmentation_ratio
-    )
-
-    print(
-        "\nGenerating",
-        number_of_samples,
-        "synthetic samples using GAN..."
-    )
-
-    synthetic_data = generate_synthetic_data(
-        X_train,
-        number_of_samples
-    )
-
-    X_augmented = np.concatenate(
-        [
+        model.fit(
             X_train,
-            synthetic_data
-        ],
-        axis=0
-    )
+            y_train,
+            validation_data=(
+                X_val,
+                y_val
+            ),
+            epochs=3,
+            batch_size=BATCH_SIZE,
+            verbose=0
+        )
 
-    print(
-        "Original training samples:",
-        len(X_train)
-    )
+        return float(
+            model.evaluate(
+                X_val,
+                y_val,
+                verbose=0
+            )[0]
+        )
 
-    print(
-        "Augmented training samples:",
-        len(X_augmented)
-    )
+    bounds = [
+        (64, 192),
+        (32, 96),
+        (1e-4, 3e-3)
+    ]
 
-    return X_augmented
-
-
-# ============================================================
-# 9. Evaluation
-# ============================================================
-
-def calculate_metrics(
-    y_true,
-    y_pred
-):
-
-    mae = mean_absolute_error(
-        y_true,
-        y_pred
-    )
-
-    rmse = np.sqrt(
-        mean_squared_error(
-            y_true,
-            y_pred
+    best_position, best_score, history = (
+        optimize_hyperparameters(
+            objective,
+            bounds,
+            n_particles=6,
+            max_iter=5,
+            seed=SEED,
+            verbose=True
         )
     )
 
-    denominator = np.maximum(
-        np.abs(y_true),
-        1e-8
+    controller_size = int(
+        round(best_position[0])
     )
 
-    mape = np.mean(
-        np.abs(
-            (y_true - y_pred)
-            / denominator
-        )
-    ) * 100
-
-    r2 = r2_score(
-        y_true,
-        y_pred
+    memory_size = int(
+        round(best_position[1])
     )
 
-    return {
-        "MAE": mae,
-        "RMSE": rmse,
-        "MAPE": mape,
-        "R2": r2
-    }
-
-
-# ============================================================
-# 10. Main experimental pipeline
-# ============================================================
-
-def main():
-
-    print("=" * 70)
-    print("GAN-AM-NTM-APSO Environmental Prediction Framework")
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # Dataset
-    # --------------------------------------------------------
-
-    df = load_dataset()
-
-    X, y, feature_columns = prepare_data(
-        df
-    )
-
-    # --------------------------------------------------------
-    # Split
-    # --------------------------------------------------------
-
-    (
-        X_train,
-        X_validation,
-        X_test,
-        y_train,
-        y_validation,
-        y_test
-    ) = split_data(X, y)
-
-    # --------------------------------------------------------
-    # Scaling
-    # --------------------------------------------------------
-
-    (
-        X_train,
-        X_validation,
-        X_test,
-        y_train,
-        y_validation,
-        y_test,
-        x_scaler,
-        y_scaler
-    ) = scale_data(
-        X_train,
-        X_validation,
-        X_test,
-        y_train,
-        y_validation,
-        y_test
-    )
-
-    # --------------------------------------------------------
-    # GAN augmentation
-    # --------------------------------------------------------
-
-    X_train_augmented = \
-        perform_gan_augmentation(
-            X_train
-        )
-
-    # --------------------------------------------------------
-    # Temporal sequences
-    # --------------------------------------------------------
-
-    X_train_seq, y_train_seq = \
-        create_sequences(
-            X_train_augmented,
-            np.resize(
-                y_train,
-                (
-                    len(X_train_augmented),
-                    y_train.shape[1]
-                )
-            )
-        )
-
-    X_validation_seq, y_validation_seq = \
-        create_sequences(
-            X_validation,
-            y_validation
-        )
-
-    X_test_seq, y_test_seq = \
-        create_sequences(
-            X_test,
-            y_test
-        )
-
-    print(
-        "\nSequence shape:",
-        X_train_seq.shape
-    )
-
-    # --------------------------------------------------------
-    # AM-NTM
-    # --------------------------------------------------------
-
-    model = build_am_ntm_model(
-        input_shape=(
-            X_train_seq.shape[1],
-            X_train_seq.shape[2]
-        ),
-        output_dim=len(TARGETS)
-    )
-
-    # --------------------------------------------------------
-    # APSO
-    # --------------------------------------------------------
-
-    print(
-        "\nStarting APSO optimization..."
-    )
-
-    best_parameters = optimize_model(
-        model,
-        X_validation_seq,
-        y_validation_seq
+    learning_rate = float(
+        best_position[2]
     )
 
     print(
         "\nBest APSO parameters:"
     )
 
-    print(best_parameters)
+    print(
+        "controller_size =",
+        controller_size
+    )
 
-    # --------------------------------------------------------
-    # Final training
-    # --------------------------------------------------------
+    print(
+        "memory_size =",
+        memory_size
+    )
+
+    print(
+        "learning_rate =",
+        learning_rate
+    )
+
+    # -------------------------------------------------------
+    # Final AM-NTM model
+    # -------------------------------------------------------
+
+    model = build_am_ntm(
+        input_dim=n_features,
+        output_dim=n_targets,
+        controller_size=controller_size,
+        memory_size=memory_size,
+        learning_rate=learning_rate
+    )
 
     model.fit(
-        X_train_seq,
-        y_train_seq,
+        X_train,
+        y_train,
         validation_data=(
-            X_validation_seq,
-            y_validation_seq
+            X_val,
+            y_val
         ),
-        epochs=EPOCHS,
+        epochs=FINAL_EPOCHS,
         batch_size=BATCH_SIZE,
         verbose=1
     )
 
-    # --------------------------------------------------------
-    # Prediction
-    # --------------------------------------------------------
-
-    predictions_scaled = model.predict(
-        X_test_seq,
+    prediction_scaled = model.predict(
+        X_test,
         verbose=0
     )
 
-    predictions = y_scaler.inverse_transform(
-        predictions_scaled
+    # Inverse-transform only the target dimensions.
+    target_scaler = MinMaxScaler(
+        feature_range=(-1, 1)
     )
 
-    y_test_original = \
-        y_scaler.inverse_transform(
-            y_test_seq
-        )
+    target_scaler.fit(
+        train_raw[:, n_features:]
+    )
 
-    # --------------------------------------------------------
-    # Evaluation
-    # --------------------------------------------------------
+    prediction = target_scaler.inverse_transform(
+        prediction_scaled[:, -1, :]
+    )
 
-    print("\n")
-    print("=" * 70)
-    print("FINAL TEST RESULTS")
-    print("=" * 70)
+    true = target_scaler.inverse_transform(
+        y_test
+    )
 
-    results = {}
+    results = []
 
     for i, target in enumerate(
         TARGETS
     ):
 
-        result = calculate_metrics(
-            y_test_original[:, i],
-            predictions[:, i]
+        result = evaluate_metrics(
+            true[:, i],
+            prediction[:, i]
         )
 
-        results[target] = result
-
-        print(
-            f"\n{target}"
-        )
-
-        print(
-            f"MAE  : {result['MAE']:.4f}"
-        )
-
-        print(
-            f"RMSE : {result['RMSE']:.4f}"
-        )
-
-        print(
-            f"MAPE : {result['MAPE']:.2f}%"
-        )
-
-        print(
-            f"R2   : {result['R2']:.4f}"
-        )
-
-    # --------------------------------------------------------
-    # Save results
-    # --------------------------------------------------------
-
-    result_rows = []
-
-    for target, values in results.items():
-
-        result_rows.append(
+        results.append(
             {
                 "Target": target,
-                "MAE": values["MAE"],
-                "RMSE": values["RMSE"],
-                "MAPE (%)": values["MAPE"],
-                "R2": values["R2"]
+                **result
             }
         )
 
+        print(
+            f"\n{target}:"
+        )
+
+        for key, value in result.items():
+            print(
+                f"{key}: {value:.6f}"
+            )
+
     pd.DataFrame(
-        result_rows
+        results
     ).to_csv(
         "GAN_AM_NTM_APSO_results.csv",
         index=False
     )
 
+    pd.DataFrame(
+        history
+    ).to_csv(
+        "APSO_history.csv",
+        index=False
+    )
+
+    model.save(
+        "GAN_AM_NTM_APSO_model.keras"
+    )
+
     print(
-        "\nResults saved to:"
-        " GAN_AM_NTM_APSO_results.csv"
+        "\nExecution completed."
     )
 
 
